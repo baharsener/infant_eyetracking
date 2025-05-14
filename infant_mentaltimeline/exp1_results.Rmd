@@ -1,0 +1,426 @@
+---
+title: "Baby MTL Experiment 1"
+output:
+  word_document: default
+  html_document: default
+date: "2023-11-26"
+editor_options:
+  
+  chunk_output_type: console
+---
+##Setup
+```{r setup, include=FALSE}
+library(tidyverse); library(ggbeeswarm); library(lmerTest); library(janitor); library(here); library(pwr); library(tidyr); library(influence.ME); library(performance); library(see); library(patchwork); library(emmeans)
+
+knitr::opts_knit$set(root.dir = getwd())
+
+theme_Publication <- function(base_size=18, base_family="Helvetica") {
+  library(grid); library(ggthemes)
+  (theme_foundation(base_size=base_size, base_family=base_family)
+    + theme(plot.title = element_text(face = "bold",size = rel(1.2), hjust = 0.5),
+            text = element_text(),panel.background = element_rect(colour = NA), plot.background =
+              element_rect(colour = NA),
+            panel.border = element_rect(colour = NA),axis.title = element_text(face = "bold",size = rel(1)),
+            axis.title.y = element_text(angle=90,vjust =2),axis.title.x = element_text(vjust = -0.2),
+            axis.text = element_text(), axis.line = element_line(colour="black"),axis.ticks = element_line(),
+            panel.grid.major = element_blank(),panel.grid.minor = element_blank(),
+            legend.position = "right", legend.direction = "vertical", legend.key.size= unit(0.8, "cm"),
+            legend.title = element_text(face="bold", size = rel(0.8)), legend.key = element_rect(colour = NA), 
+            plot.margin=unit(c(10,5,5,5),"mm"),
+            strip.background=element_rect(colour="#f0f0f0",fill="#f0f0f0"),strip.text = element_text(face="bold")))
+}
+
+rbind.all.columns <- function(x, y) {
+ 
+    x.diff <- setdiff(colnames(x), colnames(y))
+    y.diff <- setdiff(colnames(y), colnames(x))
+ 
+    x[, c(as.character(y.diff))] <- NA
+ 
+    y[, c(as.character(x.diff))] <- NA
+ 
+    return(rbind(x, y))
+}
+format_p <- function(pval){
+  if(pval < 0.001){"< .001"} else if(pval < 0.009){str_remove(round(pval,3), "^0+")} else {str_remove(round(pval,2), "^0+")}
+}
+
+#Taken from Liu et al., 2022:
+# function for identifying influential observations, and then returning a new model without them
+# INPUTS: model = model name, data = dataset, and sub_n = column heading for observations
+# OUTPUT: model excluding influential subjects
+exclude.cooks <- function(model, data, sub_n) {
+  cooks <- cooks.distance(influence(model, sub_n))
+  cutoff <- 4/length(unique(data$sub_n))
+  new.model <- exclude.influence(model, grouping = sub_n, level = data[which(cooks > cutoff),]$sub_n)
+  return(new.model)
+}
+```
+
+##Load and clean Paris data
+```{r Exp 1- Paris babies, warning = FALSE, message = FALSE, echo=FALSE, eval=FALSE}
+#for knitting
+#rawData <- read.csv("/Users/baharsener/Library/CloudStorage/OneDrive-UW/Studies - LCD Lab/Baby MTL/Data/Experiment1/Exp1_rawdata.csv")
+
+# Load data files
+rawData <- read.csv("Data/Experiment1/Exp1_rawdata.csv")
+rawData <- clean_names(rawData)
+ 
+#remove rows where there are no participant information. Using the age column because there is one row with a participant number but no other information.
+rawData <- rawData %>% filter(!is.na(rawData$age_month))
+
+# get rid of the extra columns at the end
+rawData <- rawData[1:34]
+rawData <- rawData %>%
+  select(-c(test_date, coder_off_line_1, exclu, comments))
+
+# make sure capitalization matches
+rawData <- rawData %>%
+  mutate(hab_condition = tolower(hab_condition),
+         first_test_trial = tolower(first_test_trial))
+  
+# make sure there are no trailing spaces  
+rawData <- rawData %>%
+    mutate(hab_condition = trimws(hab_condition),
+         first_test_trial = trimws(first_test_trial))
+
+#now this df also has babies excluded for short looking time
+
+# Final csv
+write.csv(rawData, "Data/Experiment1/exp1_cleanraw.csv", row.names = FALSE)
+
+#for knitting:
+#write.csv(rawData, "/Users/baharsener/Library/CloudStorage/OneDrive-UW/Studies - LCD Lab/Baby MTL/Data/Experiment1/exp1_final.csv", row.names = FALSE)
+```
+#Exclusion
+###Data Quality
+```{r data quality, warning = FALSE, message = FALSE, echo=FALSE}
+#for knitting:
+puppetMTL <- read.csv("/Users/baharsener/Library/CloudStorage/OneDrive-UW/Studies - LCD Lab/Baby MTL/Data/Experiment1/exp1_cleanraw.csv")
+
+#puppetMTL <- read.csv("Data/Experiment1/exp1_cleanraw.csv")
+# They removed babies with less than 2 seconds of looking time at test (3, 51) actually not sure which columns they used but it seems like they noted they haven't gone through all of it yet.
+# They removed subject 1 because of a technical issue (video too slow and too loud)
+# They removed three subjects due to experimenter error, no video (6, 9, 16)
+# They removed one subjects due to being premature (25)
+# They removed one subjects because the online and offline coding was too different (32)
+
+# Remove low looking time from averaged columns
+puppetMTL <- puppetMTL %>%
+  mutate(exclusion = (
+    case_when(
+      sub_n == 1 ~ "technical error",
+      sub_n %in% c(6, 9, 16) ~ "experimenter error",
+      sub_n == 25 ~ "premature",
+      sub_n == 32 ~ "coding discrepancy",
+      ave_test1 < 2 | ave_test2 < 2 ~ "low looking", 
+    TRUE ~ "include" 
+    )
+  ))
+
+
+# save excluded participants in a separate df
+exclusion_data_quality <- puppetMTL %>%
+  filter(puppetMTL$exclusion != "include")
+
+# included participants
+puppetMTL <- puppetMTL %>%
+  filter(puppetMTL$exclusion == "include")
+length(unique(puppetMTL$sub_n))
+```
+
+###Cook's distance
+```{r finding outliers, warning = FALSE, message = FALSE, echo=FALSE}
+# I will now make a df that only has test trial information
+
+# They use the averaged test trials for these
+# Put the experiment dataframe to long format to run the model
+puppet_long <- puppetMTL %>%
+  select(c(sub_n, hab_condition, first_test_trial, ave_test1, ave_test2)) %>%
+  pivot_longer(4:5, names_to="test_condition", values_to="look_time")
+
+# Mark test trials
+puppet_long <- puppet_long %>%
+  group_by(sub_n) %>%
+  mutate(test_condition = case_when(
+    first_test_trial == 'cong' ~ rep(c('congruent', 'incongruent'), length.out = n()),
+    first_test_trial == 'incong' ~ rep(c('incongruent', 'congruent'), length.out = n())
+  )) %>%
+  ungroup()
+
+# Make sure data types are correct before running initial model
+puppet_long$hab_condition <- as.factor(puppet_long$hab_condition)
+puppet_long$test_condition <- as.factor(puppet_long$test_condition)
+puppet_long$sub_n <- as.factor(puppet_long$sub_n)
+
+# Using the influence.ME package, cooks distance method:
+# Initialize a dataframe to store cook's distance values
+cooks_values.df <- as.data.frame(unique(puppet_long$sub_n))
+
+# Run initial model
+#make sure data types are correct
+lmermodelInitial <- lmer(look_time ~ hab_condition*test_condition + (1|sub_n), data = puppet_long, control=lmerControl(optimizer= "bobyqa",optCtrl=list(maxfun=100000)))
+summary(lmermodelInitial)
+
+# Visualize the model
+check_model(lmermodelInitial)
+
+# Get cooks distance values and add to a df
+alt.est <- influence(lmermodelInitial, group = "sub_n")
+cooks_values <- cooks.distance(alt.est)
+cooks_values.df$cooks_values <- cooks_values
+colnames(cooks_values.df) <- c("sub_n", "cooksValues")
+
+#"The R help file advises that an observation with Cook’s distance larger than three times the mean Cook’s distance might be an outlier."
+mean_cooks_d <- mean(cooks_values)
+cooks_influential_points <- cooks_values > (3 * mean_cooks_d)
+
+# Visualize the outliers
+plot(influence(lmermodelInitial, "sub_n"), which = "cook",
+     cutoff = (3 * mean_cooks_d), sort = TRUE, 
+     xlab = "Cook's Distance",
+     ylab = "participant ID") #this plot identifies 6 outliers!
+
+# Flag and remove the outliers
+cooks_values.df$Outlier <- cooks_influential_points
+cooks_included <- subset(cooks_values.df, Outlier == FALSE)
+
+# Remove the outliers from trial-level dataframe (only include participants that are in cooks_included in this df)
+puppetMTL_included <- puppet_long  %>% 
+  filter(sub_n %in% cooks_included$sub_n)
+
+# How many subjects do we have after exclusion?
+length(unique(puppetMTL_included$sub_n))
+# We are left with n = 39
+
+#make sure outliers are removed from all datafranes
+puppet_long <- puppet_long %>%
+  filter(sub_n %in% puppetMTL_included$sub_n)
+length(unique(puppet_long$sub_n))
+
+puppetMTL <- puppetMTL %>%
+  filter(sub_n %in% puppetMTL_included$sub_n)
+length(unique(puppetMTL$sub_n))
+
+
+
+# Mark test trials
+puppet_long <- puppet_long %>%
+  group_by(sub_n) %>%
+  mutate(test_condition = case_when(
+    first_test_trial == 'cong' ~ rep(c('congruent', 'incongruent'), length.out = n()),
+    first_test_trial == 'incong' ~ rep(c('incongruent', 'congruent'), length.out = n())
+  )) %>%
+  ungroup()
+
+write.csv(puppet_long, "Analysis/Experiment 1/exp1_finaltest.csv")
+
+```
+
+
+#Data Analysis and Exploration
+### Full Model
+```{r data analysis,  warning = FALSE, message = FALSE, echo=FALSE}
+# Run the model with outliers removed
+modelParis <- lmer(look_time ~ hab_condition*test_condition + (1|sub_n), data = puppetMTL_included, control=lmerControl(optimizer= "bobyqa",optCtrl=list(maxfun=100000)))
+summary(modelParis)
+reflmermodelF <- summary(modelParis)
+
+# We get a boundary (singular) warning, so let's look at it without the subject as random effect:
+lmParis <- lm(look_time ~ hab_condition*test_condition, data = puppetMTL_included)
+summary(lmParis)
+# So this model shows that the subject effect we are putting in the model is not explaining any variance. 
+
+# Visual inspection of the model with outliers removed
+check_model(modelParis)
+
+modelCBL <- lmer(look_time ~ hab_condition*test_condition + (1|first_test_trial), data = puppetMTL_included, control=lmerControl(optimizer= "bobyqa",optCtrl=list(maxfun=100000)))
+summary(modelCBL)
+```
+###Demographics
+```{r task information, warning = FALSE, message = FALSE, echo=FALSE}
+# some info about task
+# puppet MTL has outliers removed
+puppetMTL <- rename(puppetMTL, n.hab = total_hab_trials)
+
+medianHab <- median(puppetMTL$n.hab) #7 trials
+meanHab <- mean(puppetMTL$n.hab) #8.46
+
+hab_byCondition <- puppetMTL %>%
+  group_by(hab_condition) %>%
+  summarize(
+     mean(n.hab),
+     median(n.hab))
+# on first look LR babies did more habituation trials
+
+# demographics
+# sex
+n_F <- sum(puppetMTL$gender == "F") #n=24 female
+
+# age
+puppetMTL$total_days <- puppetMTL$age_month * 30 + puppetMTL$age_days
+age_df <- data.frame()
+average_days <- mean(puppetMTL$total_days)
+average_months <- floor(average_days / 30)
+remaining_days <- average_days %% 30
+cat("average age", average_months, "months", remaining_days, "days\n")
+
+# Just checking the counterbalance (it made it easier for me to use the exp 3 breakdown here)
+puppetMTL_included <- puppetMTL_included %>%
+  mutate(cbl_condition = case_when(
+      puppetMTL_included$hab_condition == "lr" & puppetMTL_included$first_test_trial == "cong" ~ "A1",
+      puppetMTL_included$hab_condition == "lr" & puppetMTL_included$first_test_trial == "incong" ~ "A2",
+      puppetMTL_included$hab_condition == "random" & puppetMTL_included$first_test_trial == "cong" ~ "B1",
+      puppetMTL_included$hab_condition == "random" & puppetMTL_included$first_test_trial == "incong" ~ "B2",
+      TRUE ~ "check"))
+
+cbl_count <- puppetMTL_included %>%
+  group_by(cbl_condition) %>%
+  summarize(count = n())
+
+# How many habituated?
+hab_count <- puppetMTL %>%
+  group_by(hab_condition) %>%
+  count(n.hab < 14)
+
+hab_count <- puppetMTL %>%
+    group_by(hab_condition) %>%
+  mutate(half_first3 = first_3_hab / 2) %>%
+  mutate(Habituated = case_when(
+    last_3_hab <= half_first3 ~ TRUE,
+    TRUE ~ FALSE
+  ))
+
+n.habituated <- sum(hab_count$Habituated == TRUE)
+avg_first3 <- mean(puppetMTL$first_3_hab)
+avg_test_look <- mean(puppet_long$look_time)
+```
+
+### Habituation condition x test trial preference
+```{r habituation on looking, warning = FALSE, message = FALSE, echo=FALSE}
+# mark how many infants looked longer at incongruent trials
+test_cond_looking <- puppetMTL_included %>%
+  pivot_wider(names_from = test_condition, values_from = look_time) %>%
+  group_by(sub_n) %>%
+  mutate(longer_inc = case_when(
+    incongruent > congruent ~ TRUE,
+    TRUE ~ FALSE))
+
+# summarize the proportion of babies that looked longer at incongruent trials in each condition
+group_cond_looking <- test_cond_looking %>%
+  group_by(hab_condition) %>%
+  summarize(
+    num_participants = length(sub_n),
+    num_longer = sum(longer_inc == TRUE),
+    prop = num_longer/num_participants)
+
+# group-level data: looking time at test by habituation condition
+testbyCondition <- puppet_long %>%
+  group_by(hab_condition, test_condition) %>% 
+  na.exclude(look_time) %>%
+  summarise(looking = mean(look_time), sd = sd(look_time), se =sd(look_time)/sqrt(n())) %>%
+  mutate(se_lo = looking - se,
+         se_hi = looking + se)
+
+# group-level data: looking time at test overall
+testType_look <- puppet_long %>%
+  group_by(test_condition) %>% 
+  na.exclude(look_time) %>%
+  summarise(looking = mean(look_time), sd = sd(look_time), se =sd(look_time)/sqrt(n())) %>%
+  mutate(se_lo = looking - se,
+         se_hi = looking + se)
+```
+In Experiment 1 (N = `r length(unique(puppetMTL$sub_n))`, data collected in France), infants were tested with sequences consisting of puppet faces. Overall, there was a main effect of test condition ($\beta$ = `r round(modelParis@beta[3],2)`, $p$ = `r format_p(reflmermodelF$coefficients[3,5])`), such that infants looked longer at the incongruent test trials relative to the congruent test trials (Incongruent: *M* = `r round(testType_look$looking[2],2)`, *SE* = `r round(testType_look$se[2],2)`, Congruent: *M* = `r round(testType_look$looking[1],2)`, *SE* = `r round(testType_look$se[1],2)`). The predicted interaction between habituation condition and test trial type was also significant $\beta$ = `r round(modelParis@beta[4],2)`, $p$ = `r format_p(reflmermodelF$coefficients[4,5])`). Infants habituated in the left-to-right habituation condition looked longer at incongruent test trials relative to infants in the nonlinear habituation condition (Left-to-right: Incongruent: *M* = `r round(testbyCondition$looking[2],2)`, *SE* = `r round(testbyCondition$se[2],2)`, Congruent: *M* = `r round(testbyCondition$looking[1],2)`, *SE* = `r round(testbyCondition$se[1],2)`, Nonlinear: Incongruent: *M* = `r round(testbyCondition$looking[4],2)`, *SE* = `r round(testbyCondition$se[4],2)`, Congruent: *M* = `r round(testbyCondition$looking[3],2)`, *SE* = `r round(testbyCondition$se[3],2)`). Overall `r group_cond_looking$num_longer[1]` out of 20 infants in the left-to-right condition looked longer at the incongruent test trials compared to the congruent test trials, whereas `r group_cond_looking$num_longer[2]` out of 20 in the nonlinear condition looked longer at the incongruent test trials. 
+
+The final sample included N = `r length(unique(puppetMTL$sub_n))` participants (*Mage* = `r average_months` months and `r round(remaining_days)` day, range: 5 months and 14 days - 6 months and 29 days, n = `r n_F` female). Twenty of these participants were assigned to the left-to-right habituation condition, and 20 were assigned to the nonlinear habituation condition. Whether participants saw the congruent or the incongruent test trial first was counterbalanced across participants. Data from an additional 14 participants were removed due to outlier values (n = 6), experimenter error (n = 3), less than 2 seconds of looking to either test trial (n = 2), premature birth (n = 1), technical error (n = 1), a large discrepancy in looking time determined by two coders (n = 1).
+In Experiment 1, the average looking time for the first three habituation trials across all participants was around `r round(avg_first3, 1)` seconds, and in Experiment 2, X seconds. A similar pattern was true for test trials as well, such that the average looking time to test trials across all conditions was around `r round(avg_test_look,1)` seconds for Experiment 1 and X seconds for Experiment 2.  This difference in looking times has also influenced the number of infants who met the habituation criteria, and the number of habituation trials infants in each experiment completed. `r n.habituated`  infants in Experiment 1 and X infants in Experiment 2  met the habituation criteria. Importantly, there was a minimum 5-seconds of looking time criteria implemented for Experiment 2, to prevent trials from ending prematurely due to loss of the eye from the eyetracker (e.g., because the infant partially blocks one eye or the tracking sticker). This requirement may have artificially inflated the number of habituation trials infants had to view, because if their looking time was lower than 10 seconds in the first three trials, they could not have met the habituation criteria. Overall, infants in Experiment 1 completed a median of `r median_hab` habituation trials and infants in Experiment 2 completed a median of 14 (the maximum number).
+
+### Follow-up stats
+```{r follow-up stats, warning=FALSE, echo=FALSE, message=FALSE}
+#1. Contrasts and follow up tests using emmeans (run this separately for the different conditions comparison
+# To first estimate cell means and create an emmeans object, you can use the emmeans() function in the emmeans:: package:
+# Start with the interaction:
+modelParis.emm <- emmeans(modelParis, ~ hab_condition | test_condition)
+#or equivalently emmeans(modelParis, "hab_condition", by =  "test_condition").
+
+# Look at the contrast
+contrast(modelParis.emm, 'tukey') %>%
+  broom::tidy() %>%
+  head()
+
+# It might be nice to extract the estimates and plot them:
+modelParis.emm.df <-
+  modelParis.emm %>%
+  broom::tidy()
+
+# 2.  Are there more babies looking at incongruent vs congruent trials based on habituation condition?
+test_cond_looking$hab_condition <- as.factor(test_cond_looking$hab_condition)
+cond_glmer <- glmer(longer_inc ~ hab_condition + (1 | sub_n), family = binomial(link = "logit"), control = glmerControl(optimizer = "bobyqa"), data = test_cond_looking)
+summary(cond_glmer)
+# doesn't seem like it
+
+#calculate difference scores and histogram it:
+test_cond_looking <- test_cond_looking %>%
+  mutate(look_difference = incongruent - congruent)
+
+#3. Is there an influence of which test trial is run first?
+# See if which test trial they saw first makes a difference:
+group_cond_cbl <- test_cond_looking %>%
+  group_by(hab_condition, first_test_trial) %>%
+  summarize(
+    num_participants = length(sub_n),
+    num_longer = sum(longer_inc == TRUE),
+    prop = num_longer/num_participants)
+
+# Run stats on this? Seeing incongruent first might have helped in the LR condition.
+testbyCBL <- puppet_long %>%
+  group_by(hab_condition, test_condition, first_test_trial) %>% 
+  na.exclude(look_time) %>%
+  summarise(looking = mean(look_time), sd = sd(look_time), se =sd(look_time)/sqrt(n())) %>%
+  mutate(se_lo = looking - se,
+         se_hi = looking + se)
+
+# Looks like the effect might be a little stronger for babies in the LR condition who saw the incongruent test trial first, let's see if this is true:
+
+# Only linear:
+LR_cbl <- puppetMTL_included %>%
+  filter(hab_condition == "lr")
+LR_cbl.model <- lmer(look_time ~ first_test_trial*test_condition + (1|sub_n), data = LR_cbl)
+summary(LR_cbl.model)
+# no difference
+
+# Only nonlinear:
+NL_cbl <- puppetMTL_included %>%
+  filter(hab_condition == "random")
+NL_cbl.model <- lmer(look_time ~ first_test_trial*test_condition + (1|sub_n), data = NL_cbl)
+summary(NL_cbl.model)
+# also no difference here. 
+```
+
+```{r plots, warning=FALSE, message=FALSE, echo=FALSE}
+# Visualize:
+# Difference at looking at the two test trials by hab condition and plot
+ggplot(test_cond_looking, aes(x = look_difference, fill = hab_condition)) +
+  geom_histogram(binwidth = 0.6, position = "dodge", color = "black", alpha = 0.7) +
+  labs(
+    title = "Difference in Looking at Test Trials by Condition",
+    x = "Difference (seconds)",
+    y = "Number of participants") +
+  theme_Publication() +
+  scale_fill_manual(labels = c("Left-to-right", "Nonlinear"), values = c("lr" = "purple", "random" = "yellow"), name = "Habituation Condition")
+
+# Visualize:
+# Plot looking time to test
+ggplot(puppet_long, aes(x = test_condition, y = look_time, fill = hab_condition)) +
+  geom_boxplot(width = 0.5, outlier.colour = NA, alpha = 0.8, color="black", fill="#00A08A") +
+  geom_quasirandom(width = .15, size = 1, alpha = 1) + geom_line(aes(group = sub_n), alpha=.6) +
+  geom_errorbar(data=testbyCondition, aes(ymin = se_lo, ymax = se_hi, y=NULL), width=0) +
+  geom_point(data=testbyCondition, aes(y = looking), fill='white', shape=23, size=3) +
+  guides(fill = F) + ggtitle('Looking Time by Habituation Condition') +
+  xlab('Test Trial Type') +
+  ylab('Looking Time (seconds)') +
+  facet_wrap(~hab_condition, labeller = labeller(hab_condition = c("lr" = "Linear", "random" = "Nonlinear"))) +scale_x_discrete(labels=c('Congruent', 'Incongruent')) +
+  theme_Publication()
+
+```
+
